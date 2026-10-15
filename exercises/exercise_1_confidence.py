@@ -40,22 +40,47 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm(temperature=0).with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = llm.invoke([
+            {"role": "system", "content": (
+                "You are a senior software engineer reviewing a pull request. "
+                "Summarize what the PR does, list risk factors, and propose concrete "
+                "review comments (file, line when known, severity, body). "
+                "Then report your confidence (0.0-1.0) that your review is complete "
+                "and correct, and explain why in confidence_reasoning.\n\n"
+                "Pick the confidence in two steps:\n"
+                "1. Does the diff ADD a security vulnerability? Only these count: "
+                "insecure password hashing (MD5/SHA1), secrets or tokens stored in "
+                "plaintext, SQL built with string formatting/concatenation, hard-coded "
+                "user ids or credentials, credentials sent over plain HTTP. "
+                "Parameterized SQL, schema changes, missing input validation and "
+                "missing docs are NOT security vulnerabilities.\n"
+                "2. Choose the band:\n"
+                "- vulnerability found → 0.35-0.55, mark those comments 'blocker'.\n"
+                "- no vulnerability, but it changes a database schema or persisted "
+                "data format, or leaves open design questions a human should "
+                "confirm (e.g. migrating existing data) → 0.60-0.70.\n"
+                "- no vulnerability, trivial and self-contained, with NO database "
+                "schema or storage change → 0.75-0.90. A PR that edits a CREATE TABLE "
+                "statement is never trivial: existing databases need a migration."
+            )},
+            {"role": "user", "content": f"PR title: {state['pr_title']}\n\nDiff:\n{state['pr_diff']}"},
+        ])
+    console.print(f"  [green]✓[/green] confidence {analysis.confidence:.0%}")
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -75,11 +100,22 @@ def node_escalate(state: ReviewState) -> dict:
 
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+    g.add_node("fetch_pr", node_fetch_pr)
+    g.add_node("analyze", node_analyze)
+    g.add_node("route", node_route)
+    g.add_node("auto_approve", node_auto_approve)
+    g.add_node("human_approval", node_human_approval)
+    g.add_node("escalate", node_escalate)
+
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+    g.add_conditional_edges(
+        "route", lambda s: s["decision"],
+        {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+    )
+    for terminal in ("auto_approve", "human_approval", "escalate"):
+        g.add_edge(terminal, END)
     return g.compile()
 
 

@@ -9,6 +9,45 @@ A 2-hour lab that builds a human-in-the-loop pull-request review agent in **Lang
 
 Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
 
+## Running the completed implementation
+
+All five exercises are implemented. Configure `.env` using `.env.example`, then run:
+
+```bash
+uv sync --locked
+uv run streamlit run app.py
+```
+
+Set `GITHUB_USER` to the reviewer's GitHub username to include it in human audit
+events. `GITHUB_TOKEN` and `OPENROUTER_API_KEY` are required for live reviews.
+
+The UI keeps the thread in session state and in the `?thread=...` URL so a browser
+reload can restore the SQLite checkpoint. Existing sessions can also be opened
+from the sidebar. **Edit** submits the edited review body; **Reject** posts
+nothing. Escalation answers produce a refined review that requires a final
+Approve/Edit/Reject decision before posting. A successful result links directly
+to the created GitHub comment; posting failures appear as errors.
+
+The CLI can resume a saved session without fetching or analyzing the PR again:
+
+```bash
+uv run python exercises/exercise_4_audit.py --pr <PR_URL> --thread <THREAD_ID>
+uv run python -m audit.replay --thread <THREAD_ID>
+```
+
+Pending audit events are written in separate checkpointed nodes, avoiding
+duplicate pending rows when an interrupt resumes. Q&A, full analyses, reviewer
+decisions, posting results, and errors are retained in the audit trail.
+
+Run the offline checks (mocked LLM/GitHub, temporary SQLite, real graph and
+Streamlit interactions):
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+For redirected output on Windows PowerShell, set `$env:PYTHONUTF8 = "1"` first.
+
 ## Background — what problem does this solve?
 
 Code review is the bottleneck of most engineering teams: a senior engineer's time is finite, but PRs keep coming. PRs fall into roughly three buckets:
@@ -26,7 +65,7 @@ This lab builds an agent that auto-triages every PR:
 1. The LLM reads the diff and produces a structured review with a **self-reported confidence score**.
 2. **Confidence > 72%** → the agent posts the review comment itself; no human in the loop.
 3. **58–72%** → the agent pauses (`interrupt()`) and shows the reviewer the diff + LLM reasoning + a one-click **approve / reject / edit** panel. On approve, the comment posts.
-4. **< 58%** → the agent **escalates strongly**. It shows the reviewer *specific questions the LLM is uncertain about* ("Why MD5? Is `SYNC_URL` meant to be HTTPS in production?") and waits for answers. Then it re-asks the LLM with the answers in context and posts a **refined** review.
+4. **< 58%** → the agent **escalates strongly**. It shows the reviewer *specific questions the LLM is uncertain about* ("Why MD5? Is `SYNC_URL` meant to be HTTPS in production?") and waits for answers. Then it re-asks the LLM with the answers in context and presents a **refined** review for final approval before posting.
 
 Every step writes a row to a structured audit table — every routing decision, every human interaction, every LLM call — so the team can replay any session for compliance or debugging.
 
@@ -42,7 +81,7 @@ flowchart TD
     Escalate --> Synth[synthesize]
     Auto --> Commit[commit]
     Human --> Commit
-    Synth --> Commit
+    Synth --> Human
 ```
 
 Every node also writes one row to `audit_events`. The graph state is persisted by `AsyncSqliteSaver`, so an interrupted session can resume from exactly where it stopped — even after the process is killed.
@@ -187,7 +226,7 @@ uv run python exercises/exercise_2_hitl.py --pr https://github.com/VinUni-AI20k/
 
 When confidence is low, the agent shouldn't ask "approve/reject" — it should ask **specific questions** to gather context, then re-run the analysis with the answers.
 
-**You implement:** prompt the LLM to populate `escalation_questions` when low-confidence, `node_escalate` (calls `interrupt(kind="escalation")` with the questions), and `node_synthesize` (re-prompts the LLM using the reviewer's answers to produce a refined review).
+**You implement:** prompt the LLM to populate `escalation_questions` when low-confidence, `node_escalate` (calls `interrupt()` with a `kind="escalation"` payload), and `node_synthesize` (re-prompts the LLM using the reviewer's answers to produce a refined review). The refined review then pauses for a final approval decision.
 
 ```bash
 uv run python exercises/exercise_3_escalation.py --pr https://github.com/VinUni-AI20k/PR-Demo/pull/2

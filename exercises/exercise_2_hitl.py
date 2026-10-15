@@ -19,6 +19,7 @@ from rich.panel import Panel
 
 from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
+from exercises.review_helpers import approval_response, render_review
 from common.schemas import (
     AUTO_APPROVE_THRESHOLD,
     ESCALATE_THRESHOLD,
@@ -40,10 +41,31 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    llm = get_llm().with_structured_output(PRAnalysis)
+    llm = get_llm(temperature=0).with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": (
+                "You are a senior software engineer reviewing a pull request. "
+                "Summarize what the PR does, list risk factors, and propose concrete "
+                "review comments (file, line when known, severity, body). "
+                "Then report your confidence (0.0-1.0) that your review is complete "
+                "and correct, and explain why in confidence_reasoning.\n\n"
+                "Pick the confidence in two steps:\n"
+                "1. Does the diff ADD a security vulnerability? Only these count: "
+                "insecure password hashing (MD5/SHA1), secrets or tokens stored in "
+                "plaintext, SQL built with string formatting/concatenation, hard-coded "
+                "user ids or credentials, credentials sent over plain HTTP. "
+                "Parameterized SQL, schema changes, missing input validation and "
+                "missing docs are NOT security vulnerabilities.\n"
+                "2. Choose the band:\n"
+                "- vulnerability found → 0.35-0.55, mark those comments 'blocker'.\n"
+                "- no vulnerability, but it changes a database schema or persisted "
+                "data format, or leaves open design questions a human should "
+                "confirm (e.g. migrating existing data) → 0.60-0.70.\n"
+                "- no vulnerability, trivial and self-contained, with NO database "
+                "schema or storage change → 0.75-0.90. A PR that edits a CREATE TABLE "
+                "statement is never trivial: existing databases need a migration."
+            )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -63,21 +85,23 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"],
+        "review_body": render_review(state),
+    })
+    response = approval_response(response)
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
     """Build the Markdown comment body posted back to the PR."""
+    if state.get("human_choice") == "edit":
+        return state["human_feedback"].strip()
     a = state["analysis"]
     lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
     for c in a.comments:
@@ -100,7 +124,7 @@ def _post(state: ReviewState, label: str) -> str:
 
 def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
-    if state.get("human_choice") == "approve":
+    if state.get("human_choice") in {"approve", "edit"}:
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
@@ -133,8 +157,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -154,7 +177,13 @@ def prompt_human(payload: dict) -> dict:
     choice = ""
     while choice not in {"approve", "reject", "edit"}:
         choice = console.input("\n[bold]Choice (approve/reject/edit)?[/bold] ").strip().lower()
-    feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
+    if choice == "edit":
+        console.print(payload["review_body"], markup=False)
+        feedback = ""
+        while not feedback:
+            feedback = console.input("Edited review body: ").strip()
+    else:
+        feedback = console.input("Feedback: ").strip() if choice == "reject" else ""
     return {"choice": choice, "feedback": feedback}
 
 
@@ -174,12 +203,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
